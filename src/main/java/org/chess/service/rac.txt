@@ -1,0 +1,130 @@
+public Uni<Void> handleEndgame(GameSession session, Long winnerId, boolean isDraw) {
+        // 1. Kiểm tra xem game có thực sự tồn tại trong bộ nhớ tạm không để tránh xử lý trùng lặp
+        if (activeGames.remove(session.getId()) == null) {
+            return Uni.createFrom().voidItem();
+        }
+
+        // 2. Dọn dẹp trạng thái bộ nhớ tạm (In-memory) và Hủy bộ đếm giờ (Timer) ngay lập tức
+        cancelTimeout(session.getId());
+        playerToGameMap.remove(session.getWhitePlayerId());
+        playerToGameMap.remove(session.getBlackPlayerId());
+
+        // 3. Chuẩn bị sự kiện kết thúc trận đấu để gửi qua WebSocket
+        WebSocketConnection whiteConn = activeConnections.get(session.getWhitePlayerId());
+        WebSocketConnection blackConn = activeConnections.get(session.getBlackPlayerId());
+
+        String message = isDraw ? "Game drawn" : "Player " + winnerId + " won";
+        GameStateEvent endEvent = GameStateEvent.finished(winnerId != null ? String.valueOf(winnerId) : null, message);
+
+        // Tạo luồng gửi tin nhắn (Bọc onFailure để rớt mạng WS không làm sập luồng DB)
+        Uni<Void> notifyWhite = sendGameEvent(whiteConn, endEvent).onFailure().recoverWithItem(() -> null);
+        Uni<Void> notifyBlack = sendGameEvent(blackConn, endEvent).onFailure().recoverWithItem(() -> null);
+        Uni<Void> notifications = Uni.combine().all().unis(notifyWhite, notifyBlack).discardItems();
+
+        // 4. Khởi tạo thực thể Game sẵn sàng để chuẩn bị lưu
+        Game game = createFinishedGame(session, winnerId, isDraw);
+
+        // 5. Bọc toàn bộ quá trình tìm kiếm, cập nhật và lưu trữ vào trong một Transaction duy nhất
+        Uni<Void> persistGame = Panache.withTransaction(() ->
+                        User.<User>findById(session.getWhitePlayerId())
+                                .chain(white -> User.<User>findById(session.getBlackPlayerId())
+                                        .chain(black -> {
+
+                                            // Cập nhật thống kê và Elo cho bên Trắng
+                                            if (white != null) {
+                                                int blackElo = (black != null) ? black.elo : 1500;
+                                                applyUserResult(white, winnerId, isDraw, true, blackElo);
+                                                // Hibernate tự nhận biết thay đổi và tự động UPDATE xuống DB khi kết thúc Transaction
+                                            } else {
+                                                System.err.println("Skipping stats update for white user " + session.getWhitePlayerId() + " because not found.");
+                                            }
+
+                                            // Cập nhật thống kê và Elo cho bên Đen
+                                            if (black != null) {
+                                                int whiteElo = (white != null) ? white.elo : 1500;
+                                                applyUserResult(black, winnerId, isDraw, false, whiteElo);
+                                                // Hibernate tự nhận biết thay đổi và tự động UPDATE xuống DB khi kết thúc Transaction
+                                            } else {
+                                                System.err.println("Skipping stats update for black user " + session.getBlackPlayerId() + " because not found.");
+                                            }
+
+                                            // Lưu thực thể trận đấu (Game) vào DB (Đối tượng mới nên cần .persist())
+                                            return game.persist().replaceWithVoid();
+                                        })
+                                )
+                )
+                .onFailure().invoke(err -> {
+                    System.err.println("Lỗi nghiêm trọng không thể lưu kết quả trận đấu xuống DB: " + err.getMessage());
+                    err.printStackTrace();
+                })
+                .replaceWithVoid();
+
+        // 6. Cho cả hai tiến trình độc lập (Gửi WebSocket thông báo và Ghi vào DB) chạy song song
+        return Uni.combine().all().unis(notifications, persistGame).discardItems()
+                .onFailure().recoverWithItem(() -> null);
+    }
+
+
+
+
+
+    protected Uni<Void> handleEndgame(GameSession session, Long winnerId, boolean isDraw) {
+        // 1. Dọn dẹp trạng thái bộ nhớ tạm (In-memory) ngay lập tức
+        if (activeGames.remove(session.getId()) == null) {
+            return Uni.createFrom().voidItem();
+        }
+
+        // Hủy timer chạy ngầm
+        cancelTimeout(session.getId());
+        playerToGameMap.remove(session.getWhitePlayerId());
+        playerToGameMap.remove(session.getBlackPlayerId());
+
+        // 2. Thực hiện toàn bộ Transaction DB TRƯỚC (Tìm User -> Cập nhật Elo -> Lưu Game)
+        return Panache.withTransaction(() ->
+            User.<User>findById(session.getWhitePlayerId())
+                .chain(white -> User.<User>findById(session.getBlackPlayerId())
+                    .chain(black -> {
+
+                        // Cập nhật thống kê và Elo cho bên Trắng
+                        if (white != null) {
+                            int blackElo = (black != null) ? black.elo : 1500;
+                            applyUserResult(white, winnerId, isDraw, true, blackElo);
+                        } else {
+                            System.err.println("Skipping stats update for white user " + session.getWhitePlayerId() + " because not found.");
+                        }
+
+                        // Cập nhật thống kê và Elo cho bên Đen
+                        if (black != null) {
+                            int whiteElo = (white != null) ? white.elo : 1500;
+                            applyUserResult(black, winnerId, isDraw, false, whiteElo);
+                        } else {
+                            System.err.println("Skipping stats update for black user " + session.getBlackPlayerId() + " because not found.");
+                        }
+
+                        // Tạo thực thể Game và lưu xuống DB
+                        Game game = createFinishedGame(session, winnerId, isDraw);
+                        return game.persist().replaceWithVoid();
+                    })
+                )
+        )
+        .onFailure().invoke(err -> {
+            System.err.println("Lỗi nghiêm trọng không thể ghi dữ liệu xuống DB: " + err.getMessage());
+            err.printStackTrace();
+        })
+        // 3. Sau khi DB đã COMMIT thành công hoàn toàn, mới tiến hành gửi WebSocket
+        .chain(() -> {
+            WebSocketConnection whiteConn = activeConnections.get(session.getWhitePlayerId());
+            WebSocketConnection blackConn = activeConnections.get(session.getBlackPlayerId());
+
+            String message = isDraw ? "Game drawn" : "Player " + winnerId + " won";
+            GameStateEvent endEvent = GameStateEvent.finished(winnerId != null ? String.valueOf(winnerId) : null, message);
+
+            Uni<Void> notifyWhite = sendGameEvent(whiteConn, endEvent).onFailure().recoverWithItem(() -> null);
+            Uni<Void> notifyBlack = sendGameEvent(blackConn, endEvent).onFailure().recoverWithItem(() -> null);
+
+            return Uni.combine().all().unis(notifyWhite, notifyBlack).discardItems();
+        })
+        // Đảm bảo hàm luôn kết thúc êm đẹp mà không làm sập luồng chính
+        .onFailure().recoverWithItem(() -> null);
+    }
+
