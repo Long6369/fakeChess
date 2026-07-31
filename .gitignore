@@ -37,7 +37,7 @@ nb-configuration.xml
 *.rej
 
 .agent
-docs
+docs    
 
 # Local environment
 .env
@@ -48,3 +48,5 @@ docs
 .certs/
 
 .trae
+
+ignore/
